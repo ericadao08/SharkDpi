@@ -50,15 +50,14 @@ object Protocol {
         0xff, 0x40, 0x00,  0xff, 0xff, 0xff
     )
 
-    /** Código do mouse -> DPI (só até 5000). Devolve null se o código não está na tabela. */
-    fun dpiFromCode(code: Int): Int? {
-        val i = TABLE.indexOf(code)
-        return if (i >= 0) (i + 1) * 50 else null
-    }
+    // Taxas: 125, 250, 500, 1000 Hz -> byte do mouse.
+    val RATE_HZ = intArrayOf(125, 250, 500, 1000)
+    private val RATE_BYTE = intArrayOf(0x08, 0x04, 0x02, 0x01)
 
-    /** Relatório 0x04 (DPI), 52 bytes (versão com cabo). */
-    fun buildDpi(dpis: IntArray, active: Int): ByteArray {
-        val a = IntArray(52)
+    /** Relatório 0x04 (DPI): 52 bytes no cabo, 56 bytes no dongle. */
+    fun buildDpi(dpis: IntArray, active: Int, wireless: Boolean): ByteArray {
+        val size = if (wireless) 56 else 52
+        val a = IntArray(size)
         a[0] = 0x04; a[1] = 0x38; a[2] = 0x01
         a[3] = 0x00 // angle snap desligado
         a[4] = 0x01 // ripple ligado
@@ -73,12 +72,13 @@ object Protocol {
         for (i in 3..49) sum += a[i]
         a[50] = (sum shr 8) and 0xff
         a[51] = sum and 0xff
-        return ByteArray(52) { a[it].toByte() }
+        return ByteArray(size) { a[it].toByte() }
     }
 
-    /** Relatório 0x05 (luz contínua), experimental. */
-    fun buildLight(): ByteArray {
-        val a = IntArray(13)
+    /** Relatório 0x05 (luz contínua), experimental: 13 bytes no cabo, 15 no dongle. */
+    fun buildLight(wireless: Boolean): ByteArray {
+        val size = if (wireless) 15 else 13
+        val a = IntArray(size)
         a[0] = 0x05; a[1] = 0x0f; a[2] = 0x01
         a[3] = 0x50 // StaticDpi: luz com a cor do nível ativo
         a[4] = 3    // velocidade
@@ -90,7 +90,14 @@ object Protocol {
         var s = 0
         for (i in 3..10) s += a[i]
         a[12] = s and 0xff
-        return ByteArray(13) { a[it].toByte() }
+        return ByteArray(size) { a[it].toByte() }
+    }
+
+    /** Relatório 0x06 (taxa de atualização): 06 09 01 [taxa] [0xff - taxa] 00 00 00 00 */
+    fun buildPolling(idx: Int): ByteArray {
+        val r = RATE_BYTE[idx]
+        val a = intArrayOf(0x06, 0x09, 0x01, r, 0xff - r, 0, 0, 0, 0)
+        return ByteArray(9) { a[it].toByte() }
     }
 }
 
@@ -113,16 +120,19 @@ class MainActivity : Activity() {
     private var listenThread: Thread? = null
     @Volatile private var listening = false
     @Volatile private var ackCount = 0
+    @Volatile private var lastAck = -1
     private var unknownLogged = 0
 
     private lateinit var logView: TextView
     private lateinit var modeView: TextView
     private lateinit var stageView: TextView
     private lateinit var batteryView: TextView
+    private lateinit var pollView: TextView
     private lateinit var stageSpinner: Spinner
+    private lateinit var pollSpinner: Spinner
     private lateinit var lightCheck: CheckBox
     private lateinit var saveBtn: Button
-    private lateinit var readBtn: Button
+    private lateinit var pollBtn: Button
     private val dpiInputs = ArrayList<EditText>()
 
     private val receiver = object : BroadcastReceiver() {
@@ -184,7 +194,7 @@ class MainActivity : Activity() {
         root.setPadding(dp(16), dp(40), dp(16), dp(24))
 
         root.addView(text("Shark DPI", 24f))
-        root.addView(text("Attack Shark X11. Cabo: salva DPI. Dongle: por enquanto só escuta e lê."))
+        root.addView(text("Attack Shark X11. DPI: salva pelo cabo ou pelo dongle. Taxa: só pelo dongle."))
 
         val connectBtn = Button(this)
         connectBtn.text = "1. Conectar ao mouse"
@@ -197,11 +207,6 @@ class MainActivity : Activity() {
         root.addView(modeView)
         root.addView(stageView)
         root.addView(batteryView)
-
-        readBtn = Button(this)
-        readBtn.text = "Ler DPIs do mouse (experimental)"
-        readBtn.setOnClickListener { readFromMouse() }
-        root.addView(readBtn)
 
         root.addView(text("DPI de 50 a 5000 (passos de 50)."))
 
@@ -234,9 +239,27 @@ class MainActivity : Activity() {
         root.addView(lightCheck)
 
         saveBtn = Button(this)
-        saveBtn.text = "2. Salvar no mouse (cabo)"
+        saveBtn.text = "2. Salvar DPI no mouse"
         saveBtn.setOnClickListener { save() }
         root.addView(saveBtn)
+
+        root.addView(text("Taxa de atualização (só dongle)", 18f))
+        pollView = text("", 14f)
+        root.addView(pollView)
+        refreshPollView()
+
+        pollSpinner = Spinner(this)
+        pollSpinner.adapter = ArrayAdapter(
+            this, android.R.layout.simple_spinner_dropdown_item,
+            Protocol.RATE_HZ.map { "$it Hz" }
+        )
+        pollSpinner.setSelection(prefs.getInt("pollIdx", 3))
+        root.addView(pollSpinner)
+
+        pollBtn = Button(this)
+        pollBtn.text = "3. Enviar taxa para o mouse"
+        pollBtn.setOnClickListener { sendPolling() }
+        root.addView(pollBtn)
 
         logView = TextView(this)
         logView.textSize = 12f
@@ -279,11 +302,27 @@ class MainActivity : Activity() {
         }
     }
 
-    /** Só preenche os campos. Para valer no mouse, toque em "Salvar no mouse". */
+    private fun refreshPollView() {
+        val hz = prefs.getInt("pollHz", 0)
+        pollView.text = if (hz > 0) {
+            "Último envio do app: $hz Hz (o mouse não informa a taxa atual)"
+        } else {
+            "O mouse não informa a taxa atual e o app ainda não enviou nenhuma."
+        }
+    }
+
+    private fun setBusy(b: Boolean) {
+        runOnUiThread {
+            saveBtn.isEnabled = !b
+            pollBtn.isEnabled = !b
+        }
+    }
+
+    /** Só preenche os campos. Para valer no mouse, toque em "Salvar DPI no mouse". */
     private fun fillDefaults() {
         for (i in 0 until 6) dpiInputs[i].setText(defaults[i].toString())
         stageSpinner.setSelection(defaultActive)
-        log("Campos preenchidos com os padrões. Toque em \"Salvar no mouse\" para aplicar.")
+        log("Campos preenchidos com os padrões. Toque em \"Salvar DPI no mouse\" para aplicar.")
     }
 
     private fun connect() {
@@ -315,7 +354,7 @@ class MainActivity : Activity() {
         }
     }
 
-    // ---------- Escuta (só lê, não envia nada) ----------
+    // ---------- Escuta ----------
 
     private fun startListening(d: UsbDevice) {
         stopListening()
@@ -405,6 +444,7 @@ class MainActivity : Activity() {
                     if (s in 1..6) showStage(s) else logUnknown(p)
                 }
                 0x50 -> { // confirmação de comando recebido
+                    lastAck = b[4]
                     ackCount++
                 }
                 else -> logUnknown(p)
@@ -438,104 +478,43 @@ class MainActivity : Activity() {
         }
     }
 
-    // ---------- Ler a tabela de DPI do mouse (só pede, não muda nada) ----------
+    // ---------- Envio ----------
 
-    private fun readFromMouse() {
+    /** Envia um relatório e espera a confirmação do mouse. Devolve true se o envio foi aceito pelo USB. */
+    private fun sendReport(report: ByteArray, wValue: Int, label: String): Boolean {
         val c = conn
-        if (device == null || c == null) {
-            log("Primeiro toque em \"Conectar ao mouse\".")
-            return
+        if (c == null) {
+            log("Sem conexão com o mouse. Toque em \"Conectar ao mouse\".")
+            return false
         }
-        readBtn.isEnabled = false
-        Thread {
-            try {
-                doRead(c)
-            } catch (e: Exception) {
-                log("Erro ao ler: ${e.message}")
-            }
-            runOnUiThread { readBtn.isEnabled = true }
-        }.start()
+        val before = ackCount
+        log("Enviando $label (${report.size} bytes): ${hex(report)}")
+        val r = c.controlTransfer(0x21, 0x09, wValue, 2, report, report.size, 3000)
+        if (r != report.size) {
+            log("Envio falhou (código $r).")
+            return false
+        }
+        log("Envio OK.")
+        var waited = 0
+        while (ackCount == before && waited < 2000) {
+            Thread.sleep(50)
+            waited += 50
+        }
+        if (ackCount != before) {
+            log("O mouse confirmou o recebimento (código %02x).".format(lastAck))
+        } else {
+            log("Sem confirmação do mouse (isso não prova que falhou).")
+        }
+        return true
     }
-
-    private fun doRead(c: UsbDeviceConnection) {
-        var data: ByteArray? = null
-        for (len in intArrayOf(56, 52, 64)) {
-            val buf = ByteArray(len)
-            // GET_REPORT, relatório 0x04, interface 2
-            val n = c.controlTransfer(0xA1, 0x01, 0x0304, 2, buf, len, 1500)
-            log("Pedido de leitura ($len bytes): resultado $n")
-            if (n > 0) {
-                data = buf.copyOf(n)
-                break
-            }
-        }
-        if (data == null) {
-            log("O mouse não respondeu ao pedido de leitura. Fica o bilhete.")
-            return
-        }
-        log("Resposta: " + hex(data))
-
-        var b = IntArray(data.size) { data[it].toInt() and 0xff }
-        if (b.size >= 2 && b[0] == 0x38 && b[1] == 0x01) {
-            b = intArrayOf(0x04) + b // veio sem o número do relatório
-        }
-        if (b.size < 52 || b[0] != 0x04 || b[1] != 0x38) {
-            log("A resposta não tem o formato esperado. Não vou usar.")
-            return
-        }
-
-        var sum = 0
-        for (i in 3..49) sum += b[i]
-        val calc = sum and 0xffff
-        val got = (b[50] shl 8) or b[51]
-        val ckOk = calc == got
-
-        val codes = IntArray(6) { b[8 + it] }
-        val dpis = IntArray(6) { Protocol.dpiFromCode(codes[it]) ?: -1 }
-        val active = b[24]
-        val txt = (0 until 6).joinToString(", ") {
-            if (dpis[it] > 0) "${dpis[it]}" else "?(%02x)".format(codes[it])
-        }
-        log("Níveis lidos: $txt | ativo: $active")
-
-        if (!ckOk) {
-            log("Checksum não confere (calculado %04x, recebido %04x). Mostrei só aqui, sem preencher os campos.".format(calc, got))
-            return
-        }
-        if (dpis.any { it < 0 }) {
-            log("Algum nível tem código fora da minha tabela (acima de 5000?). Esses campos ficam como estão.")
-        }
-
-        runOnUiThread {
-            val ed = prefs.edit()
-            for (i in 0 until 6) {
-                if (dpis[i] > 0) {
-                    dpiInputs[i].setText(dpis[i].toString())
-                    ed.putInt("dpi$i", dpis[i])
-                }
-            }
-            if (active in 1..6) {
-                stageSpinner.setSelection(active - 1)
-                ed.putInt("active", active - 1)
-            }
-            ed.apply()
-            if (active in 1..6) showStage(active)
-        }
-        log("Campos preenchidos com o que o mouse informou.")
-    }
-
-    // ---------- Salvar (só pelo cabo, como antes) ----------
 
     private fun save() {
         val d = device
-        if (d == null || !usb.hasPermission(d)) {
+        if (d == null || !usb.hasPermission(d) || conn == null) {
             log("Primeiro toque em \"Conectar ao mouse\".")
             return
         }
-        if (d.productId != PID_CABLE) {
-            log("Salvar pelo dongle ainda não está liberado. Nesta versão o dongle só escuta e lê.")
-            return
-        }
+        val wireless = d.productId == PID_DONGLE
         val dpis = IntArray(6)
         for (i in 0 until 6) {
             val v = dpiInputs[i].text.toString().trim().toIntOrNull()
@@ -555,49 +534,48 @@ class MainActivity : Activity() {
         ed.putBoolean("light", lightCheck.isChecked)
         ed.apply()
 
-        val report = Protocol.buildDpi(dpis, active)
-        val light = if (lightCheck.isChecked) Protocol.buildLight() else null
+        val report = Protocol.buildDpi(dpis, active, wireless)
+        val light = if (lightCheck.isChecked) Protocol.buildLight(wireless) else null
 
-        saveBtn.isEnabled = false
+        setBusy(true)
         Thread {
             try {
-                sendDpi(report, light)
+                if (sendReport(report, 0x0304, "DPI") && light != null) {
+                    Thread.sleep(300)
+                    sendReport(light, 0x0305, "luz")
+                }
             } catch (e: Exception) {
                 log("Erro: ${e.message}")
             }
-            runOnUiThread { saveBtn.isEnabled = true }
+            setBusy(false)
         }.start()
     }
 
-    private fun sendDpi(report: ByteArray, light: ByteArray?) {
-        val c = conn
-        if (c == null) {
-            log("Sem conexão com o mouse. Toque em \"Conectar ao mouse\".")
+    private fun sendPolling() {
+        val d = device
+        if (d == null || !usb.hasPermission(d) || conn == null) {
+            log("Primeiro toque em \"Conectar ao mouse\".")
             return
         }
-        val before = ackCount
-        log("Enviando DPI (${report.size} bytes): ${hex(report)}")
-        val r = c.controlTransfer(0x21, 0x09, 0x0304, 2, report, report.size, 3000)
-        if (r != report.size) {
-            log("Envio falhou (código $r).")
+        if (d.productId != PID_DONGLE) {
+            log("A taxa só é enviada pelo dongle. Pelo cabo o mouse fica em 125 Hz.")
             return
         }
-        log("Envio OK.")
-        var waited = 0
-        while (ackCount == before && waited < 2000) {
-            Thread.sleep(50)
-            waited += 50
-        }
-        log(
-            if (ackCount != before) "O mouse confirmou o recebimento."
-            else "Sem confirmação do mouse (isso não prova que falhou)."
-        )
+        val idx = pollSpinner.selectedItemPosition
+        val hz = Protocol.RATE_HZ[idx]
+        val report = Protocol.buildPolling(idx)
 
-        if (light != null) {
-            Thread.sleep(300)
-            log("Enviando luz (${light.size} bytes): ${hex(light)}")
-            val r2 = c.controlTransfer(0x21, 0x09, 0x0305, 2, light, light.size, 3000)
-            log(if (r2 == light.size) "Luz enviada." else "Luz falhou (código $r2).")
-        }
+        setBusy(true)
+        Thread {
+            try {
+                if (sendReport(report, 0x0306, "taxa $hz Hz")) {
+                    prefs.edit().putInt("pollHz", hz).putInt("pollIdx", idx).apply()
+                    runOnUiThread { refreshPollView() }
+                }
+            } catch (e: Exception) {
+                log("Erro: ${e.message}")
+            }
+            setBusy(false)
+        }.start()
     }
 }
