@@ -50,6 +50,12 @@ object Protocol {
         0xff, 0x40, 0x00,  0xff, 0xff, 0xff
     )
 
+    /** Código do mouse -> DPI (só até 5000). Devolve null se o código não está na tabela. */
+    fun dpiFromCode(code: Int): Int? {
+        val i = TABLE.indexOf(code)
+        return if (i >= 0) (i + 1) * 50 else null
+    }
+
     /** Relatório 0x04 (DPI), 52 bytes (versão com cabo). */
     fun buildDpi(dpis: IntArray, active: Int): ByteArray {
         val a = IntArray(52)
@@ -101,7 +107,7 @@ class MainActivity : Activity() {
     private var device: UsbDevice? = null
     private val prefs by lazy { getSharedPreferences("shark", MODE_PRIVATE) }
 
-    // Escuta do mouse (passo 1: só ouvir)
+    // Escuta do mouse
     private var conn: UsbDeviceConnection? = null
     private var iface: UsbInterface? = null
     private var listenThread: Thread? = null
@@ -116,6 +122,7 @@ class MainActivity : Activity() {
     private lateinit var stageSpinner: Spinner
     private lateinit var lightCheck: CheckBox
     private lateinit var saveBtn: Button
+    private lateinit var readBtn: Button
     private val dpiInputs = ArrayList<EditText>()
 
     private val receiver = object : BroadcastReceiver() {
@@ -177,7 +184,7 @@ class MainActivity : Activity() {
         root.setPadding(dp(16), dp(40), dp(16), dp(24))
 
         root.addView(text("Shark DPI", 24f))
-        root.addView(text("Attack Shark X11. Cabo: salva DPI. Dongle: por enquanto só escuta."))
+        root.addView(text("Attack Shark X11. Cabo: salva DPI. Dongle: por enquanto só escuta e lê."))
 
         val connectBtn = Button(this)
         connectBtn.text = "1. Conectar ao mouse"
@@ -190,6 +197,11 @@ class MainActivity : Activity() {
         root.addView(modeView)
         root.addView(stageView)
         root.addView(batteryView)
+
+        readBtn = Button(this)
+        readBtn.text = "Ler DPIs do mouse (experimental)"
+        readBtn.setOnClickListener { readFromMouse() }
+        root.addView(readBtn)
 
         root.addView(text("DPI de 50 a 5000 (passos de 50)."))
 
@@ -414,6 +426,8 @@ class MainActivity : Activity() {
             val key = "dpi${s - 1}"
             val extra = if (prefs.contains(key)) "  (DPI pelo bilhete: ${prefs.getInt(key, 0)})" else ""
             stageView.text = "Nível ativo no mouse: $s$extra"
+            // O seletor "para salvar" acompanha o nível do mouse.
+            stageSpinner.setSelection(s - 1)
         }
     }
 
@@ -422,6 +436,92 @@ class MainActivity : Activity() {
         runOnUiThread {
             batteryView.text = "Bateria do mouse: $pct%  (às $t)"
         }
+    }
+
+    // ---------- Ler a tabela de DPI do mouse (só pede, não muda nada) ----------
+
+    private fun readFromMouse() {
+        val c = conn
+        if (device == null || c == null) {
+            log("Primeiro toque em \"Conectar ao mouse\".")
+            return
+        }
+        readBtn.isEnabled = false
+        Thread {
+            try {
+                doRead(c)
+            } catch (e: Exception) {
+                log("Erro ao ler: ${e.message}")
+            }
+            runOnUiThread { readBtn.isEnabled = true }
+        }.start()
+    }
+
+    private fun doRead(c: UsbDeviceConnection) {
+        var data: ByteArray? = null
+        for (len in intArrayOf(56, 52, 64)) {
+            val buf = ByteArray(len)
+            // GET_REPORT, relatório 0x04, interface 2
+            val n = c.controlTransfer(0xA1, 0x01, 0x0304, 2, buf, len, 1500)
+            log("Pedido de leitura ($len bytes): resultado $n")
+            if (n > 0) {
+                data = buf.copyOf(n)
+                break
+            }
+        }
+        if (data == null) {
+            log("O mouse não respondeu ao pedido de leitura. Fica o bilhete.")
+            return
+        }
+        log("Resposta: " + hex(data))
+
+        var b = IntArray(data.size) { data[it].toInt() and 0xff }
+        if (b.size >= 2 && b[0] == 0x38 && b[1] == 0x01) {
+            b = intArrayOf(0x04) + b // veio sem o número do relatório
+        }
+        if (b.size < 52 || b[0] != 0x04 || b[1] != 0x38) {
+            log("A resposta não tem o formato esperado. Não vou usar.")
+            return
+        }
+
+        var sum = 0
+        for (i in 3..49) sum += b[i]
+        val calc = sum and 0xffff
+        val got = (b[50] shl 8) or b[51]
+        val ckOk = calc == got
+
+        val codes = IntArray(6) { b[8 + it] }
+        val dpis = IntArray(6) { Protocol.dpiFromCode(codes[it]) ?: -1 }
+        val active = b[24]
+        val txt = (0 until 6).joinToString(", ") {
+            if (dpis[it] > 0) "${dpis[it]}" else "?(%02x)".format(codes[it])
+        }
+        log("Níveis lidos: $txt | ativo: $active")
+
+        if (!ckOk) {
+            log("Checksum não confere (calculado %04x, recebido %04x). Mostrei só aqui, sem preencher os campos.".format(calc, got))
+            return
+        }
+        if (dpis.any { it < 0 }) {
+            log("Algum nível tem código fora da minha tabela (acima de 5000?). Esses campos ficam como estão.")
+        }
+
+        runOnUiThread {
+            val ed = prefs.edit()
+            for (i in 0 until 6) {
+                if (dpis[i] > 0) {
+                    dpiInputs[i].setText(dpis[i].toString())
+                    ed.putInt("dpi$i", dpis[i])
+                }
+            }
+            if (active in 1..6) {
+                stageSpinner.setSelection(active - 1)
+                ed.putInt("active", active - 1)
+            }
+            ed.apply()
+            if (active in 1..6) showStage(active)
+        }
+        log("Campos preenchidos com o que o mouse informou.")
     }
 
     // ---------- Salvar (só pelo cabo, como antes) ----------
@@ -433,7 +533,7 @@ class MainActivity : Activity() {
             return
         }
         if (d.productId != PID_CABLE) {
-            log("Salvar pelo dongle ainda não está liberado. Nesta versão o dongle só escuta.")
+            log("Salvar pelo dongle ainda não está liberado. Nesta versão o dongle só escuta e lê.")
             return
         }
         val dpis = IntArray(6)
