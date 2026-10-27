@@ -14,7 +14,13 @@ import android.hardware.usb.UsbInterface
 import android.hardware.usb.UsbManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.text.InputType
+import android.view.InputDevice
+import android.view.MotionEvent
+import android.view.View
+import android.view.ViewGroup
 import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.CheckBox
@@ -113,6 +119,7 @@ class MainActivity : Activity() {
     private lateinit var usb: UsbManager
     private var device: UsbDevice? = null
     private val prefs by lazy { getSharedPreferences("shark", MODE_PRIVATE) }
+    private val handler = Handler(Looper.getMainLooper())
 
     // Escuta do mouse
     private var conn: UsbDeviceConnection? = null
@@ -123,6 +130,7 @@ class MainActivity : Activity() {
     @Volatile private var lastAck = -1
     private var unknownLogged = 0
 
+    private lateinit var mainScroll: ScrollView
     private lateinit var logView: TextView
     private lateinit var modeView: TextView
     private lateinit var stageView: TextView
@@ -134,6 +142,23 @@ class MainActivity : Activity() {
     private lateinit var saveBtn: Button
     private lateinit var pollBtn: Button
     private val dpiInputs = ArrayList<EditText>()
+
+    // Medidor de taxa
+    private var meterRoot: LinearLayout? = null
+    private var meterArea: View? = null
+    private var meterStatus: TextView? = null
+    private var meterResult: TextView? = null
+    private var meterActive = false
+    private val samples = ArrayList<Long>()
+    private var evCount = 0
+    private var smpCount = 0
+    private var bestHz = 0
+    private val meterTick = object : Runnable {
+        override fun run() {
+            updateMeter()
+            if (meterActive) handler.postDelayed(this, 300)
+        }
+    }
 
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(c: Context, i: Intent) {
@@ -261,6 +286,11 @@ class MainActivity : Activity() {
         pollBtn.setOnClickListener { sendPolling() }
         root.addView(pollBtn)
 
+        val meterBtn = Button(this)
+        meterBtn.text = "4. Medir a taxa do mouse (teste)"
+        meterBtn.setOnClickListener { startMeter() }
+        root.addView(meterBtn)
+
         logView = TextView(this)
         logView.textSize = 12f
         logView.typeface = Typeface.MONOSPACE
@@ -268,15 +298,40 @@ class MainActivity : Activity() {
         logView.text = prefs.getString("log", "") ?: ""
         root.addView(logView)
 
-        val scroll = ScrollView(this)
-        scroll.addView(root)
-        setContentView(scroll)
+        mainScroll = ScrollView(this)
+        mainScroll.addView(root)
+        setContentView(mainScroll)
     }
 
     override fun onDestroy() {
         super.onDestroy()
+        handler.removeCallbacks(meterTick)
         stopListening()
         unregisterReceiver(receiver)
+    }
+
+    @Suppress("DEPRECATION")
+    override fun onBackPressed() {
+        if (meterActive) stopMeter() else super.onBackPressed()
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus && meterActive) {
+            meterArea?.let {
+                it.requestFocus()
+                it.requestPointerCapture()
+            }
+        }
+    }
+
+    override fun onPointerCaptureChanged(hasCapture: Boolean) {
+        super.onPointerCaptureChanged(hasCapture)
+        meterStatus?.text = if (hasCapture) {
+            "Captura do mouse: ativa (o cursor some)"
+        } else {
+            "Captura do mouse: inativa. Mexa o mouse dentro da área cinza."
+        }
     }
 
     private fun log(msg: String) {
@@ -577,5 +632,149 @@ class MainActivity : Activity() {
             }
             setBusy(false)
         }.start()
+    }
+
+    // ---------- Medidor de taxa (só mede, não envia nada) ----------
+
+    private fun buildMeterScreen() {
+        val r = LinearLayout(this)
+        r.orientation = LinearLayout.VERTICAL
+        r.setPadding(dp(16), dp(40), dp(16), dp(16))
+
+        val title = TextView(this)
+        title.text = "Medidor de taxa"
+        title.textSize = 22f
+        r.addView(title)
+
+        val info = TextView(this)
+        info.text = "Mexa o mouse em círculos bem rápidos por uns 10 segundos. " +
+            "O cursor some enquanto mede. Para sair, toque em \"Parar e voltar\" com o dedo."
+        r.addView(info)
+
+        val status = TextView(this)
+        status.textSize = 13f
+        meterStatus = status
+        r.addView(status)
+
+        val result = TextView(this)
+        result.textSize = 16f
+        result.typeface = Typeface.MONOSPACE
+        meterResult = result
+        r.addView(result)
+
+        val row = LinearLayout(this)
+        row.orientation = LinearLayout.HORIZONTAL
+        val zero = Button(this)
+        zero.text = "Zerar"
+        zero.setOnClickListener { resetMeter() }
+        val stop = Button(this)
+        stop.text = "Parar e voltar"
+        stop.setOnClickListener { stopMeter() }
+        row.addView(zero, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        row.addView(stop, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        r.addView(row)
+
+        val area = View(this)
+        area.setBackgroundColor(0xFFE8E8E8.toInt())
+        area.isFocusable = true
+        area.isFocusableInTouchMode = true
+        area.setOnCapturedPointerListener { _, ev ->
+            onMeterEvent(ev)
+            true
+        }
+        area.setOnGenericMotionListener { _, ev ->
+            if ((ev.source and InputDevice.SOURCE_MOUSE) != 0) {
+                onMeterEvent(ev)
+                true
+            } else {
+                false
+            }
+        }
+        meterArea = area
+        r.addView(area, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+
+        meterRoot = r
+    }
+
+    private fun startMeter() {
+        if (meterRoot == null) buildMeterScreen()
+        resetMeter()
+        meterActive = true
+        setContentView(meterRoot!!)
+        meterArea?.let { a ->
+            a.post {
+                a.requestFocus()
+                a.requestPointerCapture()
+            }
+        }
+        handler.post(meterTick)
+    }
+
+    private fun stopMeter() {
+        meterActive = false
+        handler.removeCallbacks(meterTick)
+        meterArea?.releasePointerCapture()
+        setContentView(mainScroll)
+    }
+
+    private fun resetMeter() {
+        samples.clear()
+        evCount = 0
+        smpCount = 0
+        bestHz = 0
+        updateMeter()
+    }
+
+    private fun histTime(ev: MotionEvent, i: Int): Long =
+        if (Build.VERSION.SDK_INT >= 34) ev.getHistoricalEventTimeNanos(i)
+        else ev.getHistoricalEventTime(i) * 1_000_000L
+
+    private fun curTime(ev: MotionEvent): Long =
+        if (Build.VERSION.SDK_INT >= 34) ev.eventTimeNanos
+        else ev.eventTime * 1_000_000L
+
+    private fun addSample(t: Long) {
+        samples.add(t)
+        smpCount++
+        if (samples.size > 400) samples.subList(0, 100).clear()
+    }
+
+    private fun onMeterEvent(ev: MotionEvent) {
+        evCount++
+        val n = ev.historySize
+        for (i in 0 until n) addSample(histTime(ev, i))
+        addSample(curTime(ev))
+    }
+
+    private fun updateMeter() {
+        val ds = ArrayList<Long>()
+        for (i in 1 until samples.size) {
+            val d = samples[i] - samples[i - 1]
+            if (d in 1L..30_000_000L) ds.add(d)
+        }
+        val sb = StringBuilder()
+        if (ds.size < 20) {
+            sb.append("Poucos dados ainda. Mexa o mouse rápido.\n")
+        } else {
+            ds.sort()
+            val med = ds[ds.size / 2]
+            val hz = (1_000_000_000.0 / med).toInt()
+            if (hz > bestHz) bestHz = hz
+            var near = Protocol.RATE_HZ[0]
+            for (rate in Protocol.RATE_HZ) {
+                if (Math.abs(Math.log(hz.toDouble() / rate)) < Math.abs(Math.log(hz.toDouble() / near))) {
+                    near = rate
+                }
+            }
+            sb.append("Taxa medida agora: $hz Hz\n")
+            sb.append("Mais próxima: $near Hz\n")
+            sb.append("Maior vista: $bestHz Hz\n")
+            sb.append("Intervalos usados: ${ds.size}\n")
+        }
+        val per = if (evCount > 0) smpCount.toDouble() / evCount else 0.0
+        sb.append("Amostras por evento: %.1f (eventos: %d)\n".format(Locale.US, per, evCount))
+        val last = prefs.getInt("pollHz", 0)
+        sb.append(if (last > 0) "Último envio do app: $last Hz" else "O app ainda não enviou taxa.")
+        meterResult?.text = sb.toString()
     }
 }
