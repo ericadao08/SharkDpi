@@ -88,8 +88,12 @@ object Protocol {
 class MainActivity : Activity() {
 
     private val actionPerm = "com.sharkdpi.USB_PERMISSION"
+    private val defaults = intArrayOf(800, 1600, 2400, 3200, 4000, 5000)
+    private val defaultActive = 1 // posição 1 = nível 2
+
     private lateinit var usb: UsbManager
     private var device: UsbDevice? = null
+    private val prefs by lazy { getSharedPreferences("shark", MODE_PRIVATE) }
 
     private lateinit var logView: TextView
     private lateinit var stageSpinner: Spinner
@@ -138,12 +142,11 @@ class MainActivity : Activity() {
         connectBtn.setOnClickListener { connect() }
         root.addView(connectBtn)
 
-        val defaults = intArrayOf(800, 1600, 2400, 3200, 4000, 5000)
         for (i in 0 until 6) {
             root.addView(text("Nível ${i + 1}"))
             val e = EditText(this)
             e.inputType = InputType.TYPE_CLASS_NUMBER
-            e.setText(defaults[i].toString())
+            e.setText(prefs.getInt("dpi$i", defaults[i]).toString())
             dpiInputs.add(e)
             root.addView(e)
         }
@@ -154,11 +157,17 @@ class MainActivity : Activity() {
             this, android.R.layout.simple_spinner_dropdown_item,
             listOf("1", "2", "3", "4", "5", "6")
         )
-        stageSpinner.setSelection(1)
+        stageSpinner.setSelection(prefs.getInt("active", defaultActive))
         root.addView(stageSpinner)
+
+        val resetBtn = Button(this)
+        resetBtn.text = "Preencher com os padrões"
+        resetBtn.setOnClickListener { fillDefaults() }
+        root.addView(resetBtn)
 
         lightCheck = CheckBox(this)
         lightCheck.text = "Reacender a luz depois (experimental)"
+        lightCheck.isChecked = prefs.getBoolean("light", false)
         root.addView(lightCheck)
 
         saveBtn = Button(this)
@@ -170,6 +179,7 @@ class MainActivity : Activity() {
         logView.textSize = 12f
         logView.typeface = Typeface.MONOSPACE
         logView.setTextIsSelectable(true)
+        logView.text = prefs.getString("log", "") ?: ""
         root.addView(logView)
 
         val scroll = ScrollView(this)
@@ -183,10 +193,20 @@ class MainActivity : Activity() {
     }
 
     private fun log(msg: String) {
-        runOnUiThread { logView.append(msg + "\n") }
+        runOnUiThread {
+            logView.append(msg + "\n")
+            prefs.edit().putString("log", logView.text.toString().takeLast(4000)).apply()
+        }
     }
 
     private fun hex(b: ByteArray) = b.joinToString(" ") { "%02x".format(it) }
+
+    /** Só preenche os campos. Para valer no mouse, toque em "Salvar no mouse". */
+    private fun fillDefaults() {
+        for (i in 0 until 6) dpiInputs[i].setText(defaults[i].toString())
+        stageSpinner.setSelection(defaultActive)
+        log("Campos preenchidos com os padrões. Toque em \"Salvar no mouse\" para aplicar.")
+    }
 
     private fun connect() {
         val all = usb.deviceList.values
@@ -232,6 +252,14 @@ class MainActivity : Activity() {
             dpiInputs[i].setText(dpis[i].toString())
         }
         val active = stageSpinner.selectedItemPosition + 1
+
+        // O "bilhete": guarda no celular o que foi salvo.
+        val ed = prefs.edit()
+        for (i in 0 until 6) ed.putInt("dpi$i", dpis[i])
+        ed.putInt("active", stageSpinner.selectedItemPosition)
+        ed.putBoolean("light", lightCheck.isChecked)
+        ed.apply()
+
         val report = Protocol.buildDpi(dpis, active)
         val light = if (lightCheck.isChecked) Protocol.buildLight() else null
 
