@@ -23,6 +23,9 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.Spinner
 import android.widget.TextView
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 /** Montagem dos pacotes do mouse (baseado no PROTOCOL_EN.md do OpenSharkX11). */
 object Protocol {
@@ -91,11 +94,25 @@ class MainActivity : Activity() {
     private val defaults = intArrayOf(800, 1600, 2400, 3200, 4000, 5000)
     private val defaultActive = 1 // posição 1 = nível 2
 
+    private val PID_CABLE = 0xfa55
+    private val PID_DONGLE = 0xfa60
+
     private lateinit var usb: UsbManager
     private var device: UsbDevice? = null
     private val prefs by lazy { getSharedPreferences("shark", MODE_PRIVATE) }
 
+    // Escuta do mouse (passo 1: só ouvir)
+    private var conn: UsbDeviceConnection? = null
+    private var iface: UsbInterface? = null
+    private var listenThread: Thread? = null
+    @Volatile private var listening = false
+    @Volatile private var ackCount = 0
+    private var unknownLogged = 0
+
     private lateinit var logView: TextView
+    private lateinit var modeView: TextView
+    private lateinit var stageView: TextView
+    private lateinit var batteryView: TextView
     private lateinit var stageSpinner: Spinner
     private lateinit var lightCheck: CheckBox
     private lateinit var saveBtn: Button
@@ -103,12 +120,36 @@ class MainActivity : Activity() {
 
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(c: Context, i: Intent) {
-            if (i.action == actionPerm) {
-                val granted = i.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
-                log(if (granted) "Permissão concedida. Pode salvar." else "Permissão negada.")
+            when (i.action) {
+                actionPerm -> {
+                    val granted = i.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
+                    if (granted) {
+                        log("Permissão concedida.")
+                        device?.let { startListening(it) }
+                    } else {
+                        log("Permissão negada.")
+                    }
+                }
+                UsbManager.ACTION_USB_DEVICE_DETACHED -> {
+                    val d = usbDeviceFrom(i)
+                    if (d != null && d.vendorId == 0x1d57) {
+                        stopListening()
+                        device = null
+                        log("Mouse desconectado.")
+                        resetStatus()
+                    }
+                }
             }
         }
     }
+
+    @Suppress("DEPRECATION")
+    private fun usbDeviceFrom(i: Intent): UsbDevice? =
+        if (Build.VERSION.SDK_INT >= 33) {
+            i.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
+        } else {
+            i.getParcelableExtra(UsbManager.EXTRA_DEVICE)
+        }
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
@@ -117,6 +158,7 @@ class MainActivity : Activity() {
         usb = getSystemService(Context.USB_SERVICE) as UsbManager
 
         val filter = IntentFilter(actionPerm)
+        filter.addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
         if (Build.VERSION.SDK_INT >= 33) {
             registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
         } else {
@@ -135,12 +177,21 @@ class MainActivity : Activity() {
         root.setPadding(dp(16), dp(40), dp(16), dp(24))
 
         root.addView(text("Shark DPI", 24f))
-        root.addView(text("Attack Shark X11, pelo cabo USB-C. DPI de 50 a 5000 (passos de 50)."))
+        root.addView(text("Attack Shark X11. Cabo: salva DPI. Dongle: por enquanto só escuta."))
 
         val connectBtn = Button(this)
         connectBtn.text = "1. Conectar ao mouse"
         connectBtn.setOnClickListener { connect() }
         root.addView(connectBtn)
+
+        modeView = text("Conexão: —", 15f)
+        stageView = text("Nível ativo no mouse: —", 18f)
+        batteryView = text("Bateria do mouse: —", 18f)
+        root.addView(modeView)
+        root.addView(stageView)
+        root.addView(batteryView)
+
+        root.addView(text("DPI de 50 a 5000 (passos de 50)."))
 
         for (i in 0 until 6) {
             root.addView(text("Nível ${i + 1}"))
@@ -151,7 +202,7 @@ class MainActivity : Activity() {
             root.addView(e)
         }
 
-        root.addView(text("Nível ativo"))
+        root.addView(text("Nível ativo (para salvar)"))
         stageSpinner = Spinner(this)
         stageSpinner.adapter = ArrayAdapter(
             this, android.R.layout.simple_spinner_dropdown_item,
@@ -171,7 +222,7 @@ class MainActivity : Activity() {
         root.addView(lightCheck)
 
         saveBtn = Button(this)
-        saveBtn.text = "2. Salvar no mouse"
+        saveBtn.text = "2. Salvar no mouse (cabo)"
         saveBtn.setOnClickListener { save() }
         root.addView(saveBtn)
 
@@ -189,6 +240,7 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        stopListening()
         unregisterReceiver(receiver)
     }
 
@@ -201,6 +253,20 @@ class MainActivity : Activity() {
 
     private fun hex(b: ByteArray) = b.joinToString(" ") { "%02x".format(it) }
 
+    private fun modeName(d: UsbDevice) = when (d.productId) {
+        PID_CABLE -> "cabo"
+        PID_DONGLE -> "dongle"
+        else -> "desconhecido"
+    }
+
+    private fun resetStatus() {
+        runOnUiThread {
+            modeView.text = "Conexão: —"
+            stageView.text = "Nível ativo no mouse: —"
+            batteryView.text = "Bateria do mouse: —"
+        }
+    }
+
     /** Só preenche os campos. Para valer no mouse, toque em "Salvar no mouse". */
     private fun fillDefaults() {
         for (i in 0 until 6) dpiInputs[i].setText(defaults[i].toString())
@@ -211,34 +277,163 @@ class MainActivity : Activity() {
     private fun connect() {
         val all = usb.deviceList.values
         if (all.isEmpty()) {
-            log("Nenhum aparelho USB visto. Use um cabo USB-C nas duas pontas, direto no celular.")
+            log("Nenhum aparelho USB visto. Ligue o cabo USB-C ou o dongle (com adaptador) no celular.")
             return
         }
         log("USB visto: " + all.joinToString { "%04x:%04x".format(it.vendorId, it.productId) })
-        val d = all.firstOrNull { it.vendorId == 0x1d57 }
-        if (d == null) {
+        val shark = all.filter { it.vendorId == 0x1d57 }
+        if (shark.isEmpty()) {
             log("Nenhum aparelho com ID 1d57 (Attack Shark).")
             return
         }
-        if (d.productId != 0xfa55) {
-            log("Este mouse aparece como 1d57:%04x e eu só estudei o fa55. Não vou enviar nada. Me mande esse número.".format(d.productId))
+        val d = shark.firstOrNull { it.productId == PID_CABLE }
+            ?: shark.firstOrNull { it.productId == PID_DONGLE }
+        if (d == null) {
+            log("Este mouse aparece como 1d57:%04x e eu só estudei o fa55 e o fa60. Não vou usar. Me mande esse número.".format(shark[0].productId))
             return
         }
         device = d
         if (usb.hasPermission(d)) {
-            log("Mouse encontrado e já autorizado. Pode salvar.")
+            startListening(d)
         } else {
             val intent = Intent(actionPerm).setPackage(packageName)
             val flags = if (Build.VERSION.SDK_INT >= 31) PendingIntent.FLAG_MUTABLE else 0
             usb.requestPermission(d, PendingIntent.getBroadcast(this, 0, intent, flags))
-            log("Mouse encontrado. Aceite o pedido de permissão na tela.")
+            log("Aparelho encontrado. Aceite o pedido de permissão na tela.")
         }
     }
+
+    // ---------- Escuta (só lê, não envia nada) ----------
+
+    private fun startListening(d: UsbDevice) {
+        stopListening()
+        val itf = (0 until d.interfaceCount).map { d.getInterface(it) }.firstOrNull { it.id == 2 }
+        if (itf == null) {
+            log("Interface 2 não encontrada no mouse.")
+            return
+        }
+        val ep = (0 until itf.endpointCount).map { itf.getEndpoint(it) }.firstOrNull { it.address == 0x83 }
+        if (ep == null) {
+            log("Canal de avisos (0x83) não encontrado.")
+            return
+        }
+        val c = usb.openDevice(d)
+        if (c == null) {
+            log("Não consegui abrir o mouse.")
+            return
+        }
+        if (!c.claimInterface(itf, true)) {
+            log("Não consegui assumir a interface 2.")
+            c.close()
+            return
+        }
+        conn = c
+        iface = itf
+        unknownLogged = 0
+        listening = true
+        listenThread = Thread { listenLoop(c, ep) }.also { it.start() }
+
+        log("Escutando o mouse (${modeName(d)}).")
+        runOnUiThread {
+            modeView.text = "Conexão: ${modeName(d)} (%04x)".format(d.productId)
+            stageView.text = "Nível ativo no mouse: aperte o botão de DPI"
+            batteryView.text = if (d.productId == PID_CABLE) {
+                "Bateria do mouse: sem dado pelo cabo"
+            } else {
+                "Bateria do mouse: esperando o dongle avisar…"
+            }
+        }
+    }
+
+    private fun stopListening() {
+        listening = false
+        try {
+            listenThread?.join(800)
+        } catch (e: Exception) {
+        }
+        listenThread = null
+        val c = conn
+        val itf = iface
+        if (c != null) {
+            try {
+                if (itf != null) c.releaseInterface(itf)
+            } catch (e: Exception) {
+            }
+            c.close()
+        }
+        conn = null
+        iface = null
+    }
+
+    private fun listenLoop(c: UsbDeviceConnection, ep: UsbEndpoint) {
+        val buf = ByteArray(maxOf(ep.maxPacketSize, 8))
+        while (listening) {
+            val n = c.bulkTransfer(ep, buf, buf.size, 500)
+            if (n > 0) {
+                handlePacket(buf.copyOf(n))
+            } else if (n < 0) {
+                try {
+                    Thread.sleep(30)
+                } catch (e: InterruptedException) {
+                }
+            }
+        }
+    }
+
+    private fun handlePacket(p: ByteArray) {
+        val b = IntArray(p.size) { p[it].toInt() and 0xff }
+        if (b.size >= 5 && b[0] == 0x03 && b[1] == 0x55) {
+            when (b[2]) {
+                0x40 -> { // bateria
+                    val pct = b[4]
+                    if (pct in 0..100) showBattery(pct) else logUnknown(p)
+                }
+                0x10 -> { // botão de DPI
+                    val s = b[3]
+                    if (s in 1..6) showStage(s) else logUnknown(p)
+                }
+                0x50 -> { // confirmação de comando recebido
+                    ackCount++
+                }
+                else -> logUnknown(p)
+            }
+        } else {
+            logUnknown(p)
+        }
+    }
+
+    private fun logUnknown(p: ByteArray) {
+        if (unknownLogged < 15) {
+            unknownLogged++
+            log("  pacote desconhecido: " + hex(p))
+        }
+    }
+
+    private fun showStage(s: Int) {
+        runOnUiThread {
+            val key = "dpi${s - 1}"
+            val extra = if (prefs.contains(key)) "  (DPI pelo bilhete: ${prefs.getInt(key, 0)})" else ""
+            stageView.text = "Nível ativo no mouse: $s$extra"
+        }
+    }
+
+    private fun showBattery(pct: Int) {
+        val t = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
+        runOnUiThread {
+            batteryView.text = "Bateria do mouse: $pct%  (às $t)"
+        }
+    }
+
+    // ---------- Salvar (só pelo cabo, como antes) ----------
 
     private fun save() {
         val d = device
         if (d == null || !usb.hasPermission(d)) {
             log("Primeiro toque em \"Conectar ao mouse\".")
+            return
+        }
+        if (d.productId != PID_CABLE) {
+            log("Salvar pelo dongle ainda não está liberado. Nesta versão o dongle só escuta.")
             return
         }
         val dpis = IntArray(6)
@@ -266,7 +461,7 @@ class MainActivity : Activity() {
         saveBtn.isEnabled = false
         Thread {
             try {
-                sendAll(d, report, light)
+                sendDpi(report, light)
             } catch (e: Exception) {
                 log("Erro: ${e.message}")
             }
@@ -274,67 +469,35 @@ class MainActivity : Activity() {
         }.start()
     }
 
-    private fun sendAll(d: UsbDevice, report: ByteArray, light: ByteArray?) {
-        var iface: UsbInterface? = null
-        for (i in 0 until d.interfaceCount) {
-            if (d.getInterface(i).id == 2) iface = d.getInterface(i)
-        }
-        if (iface == null) {
-            log("Interface 2 não encontrada no mouse.")
+    private fun sendDpi(report: ByteArray, light: ByteArray?) {
+        val c = conn
+        if (c == null) {
+            log("Sem conexão com o mouse. Toque em \"Conectar ao mouse\".")
             return
         }
-        val conn = usb.openDevice(d)
-        if (conn == null) {
-            log("Não consegui abrir o mouse.")
+        val before = ackCount
+        log("Enviando DPI (${report.size} bytes): ${hex(report)}")
+        val r = c.controlTransfer(0x21, 0x09, 0x0304, 2, report, report.size, 3000)
+        if (r != report.size) {
+            log("Envio falhou (código $r).")
             return
         }
-        try {
-            if (!conn.claimInterface(iface, true)) {
-                log("Não consegui assumir a interface 2.")
-                return
-            }
-            log("Enviando DPI (${report.size} bytes): ${hex(report)}")
-            val r = conn.controlTransfer(0x21, 0x09, 0x0304, 2, report, report.size, 3000)
-            if (r != report.size) {
-                log("Envio falhou (código $r).")
-                return
-            }
-            log("Envio OK.")
-            readAck(conn, iface)
+        log("Envio OK.")
+        var waited = 0
+        while (ackCount == before && waited < 2000) {
+            Thread.sleep(50)
+            waited += 50
+        }
+        log(
+            if (ackCount != before) "O mouse confirmou o recebimento."
+            else "Sem confirmação do mouse (isso não prova que falhou)."
+        )
 
-            if (light != null) {
-                Thread.sleep(300)
-                log("Enviando luz (${light.size} bytes): ${hex(light)}")
-                val r2 = conn.controlTransfer(0x21, 0x09, 0x0305, 2, light, light.size, 3000)
-                log(if (r2 == light.size) "Luz enviada." else "Luz falhou (código $r2).")
-            }
-        } finally {
-            conn.releaseInterface(iface)
-            conn.close()
+        if (light != null) {
+            Thread.sleep(300)
+            log("Enviando luz (${light.size} bytes): ${hex(light)}")
+            val r2 = c.controlTransfer(0x21, 0x09, 0x0305, 2, light, light.size, 3000)
+            log(if (r2 == light.size) "Luz enviada." else "Luz falhou (código $r2).")
         }
-    }
-
-    private fun readAck(conn: UsbDeviceConnection, iface: UsbInterface) {
-        var ep: UsbEndpoint? = null
-        for (i in 0 until iface.endpointCount) {
-            val e = iface.getEndpoint(i)
-            if (e.address == 0x83) ep = e
-        }
-        if (ep == null) {
-            log("Sem canal de resposta (0x83).")
-            return
-        }
-        val buf = ByteArray(maxOf(ep.maxPacketSize, 8))
-        var ok = false
-        for (k in 0 until 6) {
-            val n = conn.bulkTransfer(ep, buf, buf.size, 700)
-            if (n <= 0) continue
-            log("  resposta: " + hex(buf.copyOf(n)))
-            if (n >= 3 && buf[1] == 0x55.toByte() && buf[2] == 0x50.toByte()) {
-                ok = true
-                break
-            }
-        }
-        log(if (ok) "O mouse confirmou o recebimento." else "Sem confirmação do mouse (isso não prova que falhou).")
     }
 }
